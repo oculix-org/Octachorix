@@ -132,6 +132,60 @@ class ImageBridgeTest {
     }
 
     @Test
+    void byteGray_subimage_fallsBackSafely_pixelsCorrect() {
+        // Parent with a distinct value at each pixel so we can tell
+        // if we accidentally read from the wrong offset.
+        BufferedImage parent = new BufferedImage(10, 10, BufferedImage.TYPE_BYTE_GRAY);
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < 10; x++) {
+                parent.getRaster().setSample(x, y, 0, (x + y * 10) & 0xFF);
+            }
+        }
+        // Sub-region (3,4) size 4x3 — parent buffer is shared, translation is (3,4).
+        BufferedImage sub = parent.getSubimage(3, 4, 4, 3);
+
+        PixelBuffer pb = ImageBridge.canonicalize(sub);
+
+        assertEquals(4, pb.width());
+        assertEquals(3, pb.height());
+        // Fallback returns 3 bpp RGB. sub.getRGB(x,y) is authoritative
+        // for what pixel (x,y) of the subimage actually renders as
+        // (TYPE_BYTE_GRAY is CS_GRAY linear, getRGB applies the
+        // linear->sRGB gamma, so the numeric value shifts predictably).
+        assertEquals(3, pb.bytesPerPixel(),
+                "sub-image falls back to RGB (safe path)");
+        int topLeftExpectedR = (sub.getRGB(0, 0) >> 16) & 0xFF;
+        assertEquals((byte) topLeftExpectedR, pb.data()[0],
+                "top-left of buffer must match sub.getRGB(0,0) - "
+                + "if this fails, fallback read from parent buffer at "
+                + "offset 0 instead of the subimage window");
+        int lastX = pb.width() - 1;
+        int lastY = pb.height() - 1;
+        int brExpectedR = (sub.getRGB(lastX, lastY) >> 16) & 0xFF;
+        int lastIdx = (lastY * pb.width() + lastX) * 3;
+        assertEquals((byte) brExpectedR, pb.data()[lastIdx],
+                "bottom-right of buffer must match sub.getRGB(w-1,h-1)");
+    }
+
+    @Test
+    void ushortGray_subimage_fallsBackSafely() {
+        BufferedImage parent = new BufferedImage(8, 8, BufferedImage.TYPE_USHORT_GRAY);
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                parent.getRaster().setSample(x, y, 0, (x + y * 32) * 256);
+            }
+        }
+        BufferedImage sub = parent.getSubimage(2, 1, 3, 2);
+        PixelBuffer pb = ImageBridge.canonicalize(sub);
+
+        assertEquals(3, pb.width());
+        assertEquals(2, pb.height());
+        // As long as canonicalize does not throw and returns a buffer
+        // sized for the SUB dimensions, the subimage-safe path works.
+        assertTrue(pb.data().length >= pb.bytesPerLine() * pb.height());
+    }
+
+    @Test
     void producedPixelBufferPassesItsOwnValidation() {
         // If canonicalize() ever produces an inconsistent PixelBuffer,
         // the record's compact constructor will throw. This exercises
