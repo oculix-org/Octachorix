@@ -107,6 +107,16 @@ class ScribeBuilderTest {
     }
 
     @Test
+    void pageSegModeUnsetIsAcceptedByBuilder() {
+        // Just check that the setter chains cleanly and does not throw.
+        // Actual effect (skipping TessBaseAPISetPageSegMode at build time)
+        // is exercised by the integration tests.
+        assertDoesNotThrow(() -> Scribe.builder()
+                .pageSegMode(org.oculix.octachorix.PageSegMode.SPARSE_TEXT)
+                .pageSegModeUnset());
+    }
+
+    @Test
     void nullOcrEngineModeRejected() {
         assertThrows(NullPointerException.class,
                 () -> Scribe.builder().ocrEngineMode(null));
