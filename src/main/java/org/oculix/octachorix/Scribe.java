@@ -18,10 +18,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The public-facing session facade: a configured, reusable Tesseract
@@ -122,27 +124,64 @@ public final class Scribe implements AutoCloseable {
     // ------------------------------------------------------------------
 
     /**
-     * Runs one recognition pass on the given image and returns the
-     * full recognized text along with per-{@link PageLevel} elements.
+     * Runs one recognition pass on the given image and returns the full
+     * recognized text along with elements at EVERY {@link PageLevel}.
      *
-     * @param image the image to recognize, non-null
-     * @return the recognition result
+     * <p>Convenience for the common case. If you only need one or two
+     * levels — for instance just {@link PageLevel#WORD} for a bounding
+     * box pass — prefer {@link #read(BufferedImage, EnumSet)}: skipping
+     * the levels you don't need spares one iterator walk each.
+     *
      * @throws OctachorixFault if the session is closed, the image is
      *                         invalid, or the native side reports an
      *                         error
      */
     public Reading read(BufferedImage image) {
-        return read(image, null);
+        return read(image, null, EnumSet.allOf(PageLevel.class));
     }
 
     /**
-     * Runs one recognition pass on a rectangular region of the given
-     * image. The region uses image coordinates; passing {@code null}
-     * for {@code roi} is equivalent to {@link #read(BufferedImage)}.
+     * Runs one recognition pass on a rectangular region of the image
+     * and returns elements at every {@link PageLevel}. Passing
+     * {@code null} for {@code roi} is equivalent to
+     * {@link #read(BufferedImage)}.
      */
     public Reading read(BufferedImage image, Rectangle roi) {
+        return read(image, roi, EnumSet.allOf(PageLevel.class));
+    }
+
+    /**
+     * Runs one recognition pass and extracts only the requested
+     * {@link PageLevel}s. The returned {@link Reading#elements()} list
+     * contains exactly the elements at those levels; asking
+     * {@link Reading#elements(PageLevel)} for a level not requested
+     * returns an empty list.
+     *
+     * <p>The single {@code TessBaseAPIRecognize} pass is the same
+     * regardless of how many levels you ask for — it is the iterator
+     * walk that scales linearly with the number of requested levels.
+     */
+    public Reading read(BufferedImage image, EnumSet<PageLevel> levels) {
+        return read(image, null, levels);
+    }
+
+    /**
+     * Runs one recognition pass on a rectangular region and extracts
+     * only the requested {@link PageLevel}s. This is the full-form
+     * method; the other {@code read} overloads delegate here.
+     *
+     * @param image  the image to recognize, non-null
+     * @param roi    a sub-rectangle in image coordinates, or
+     *               {@code null} for the whole image
+     * @param levels the segmentation levels to extract; may be empty
+     *               (recognition still runs, but the resulting
+     *               {@link Reading#elements()} list will be empty)
+     */
+    public Reading read(BufferedImage image, Rectangle roi,
+                        EnumSet<PageLevel> levels) {
         ensureOpen();
         Objects.requireNonNull(image, "image cannot be null");
+        Objects.requireNonNull(levels, "levels cannot be null");
 
         PixelBuffer buffer = ImageBridge.canonicalize(image);
         api.TessBaseAPISetImage(
@@ -170,7 +209,7 @@ public final class Scribe implements AutoCloseable {
         }
 
         String fullText = extractFullText();
-        List<TextElement> elements = extractAllLevels();
+        List<TextElement> elements = extractLevels(levels);
         return new Reading(fullText, elements);
     }
 
@@ -285,16 +324,26 @@ public final class Scribe implements AutoCloseable {
     }
 
     /**
-     * Walks the recognition result at every {@link PageLevel} and
-     * returns the flat list of {@link TextElement}s. One
-     * {@code GetIterator} + {@code IteratorDelete} per level: the
-     * Tesseract C API does not expose a reset/begin function on
+     * Walks the recognition result at each requested {@link PageLevel}
+     * and returns the flat list of {@link TextElement}s. One
+     * {@code GetIterator} + {@code IteratorDelete} per level asked:
+     * the Tesseract C API does not expose a reset/begin function on
      * {@code ResultIterator}, and re-obtaining an iterator is cheap
      * (it does not re-run recognition).
+     *
+     * <p>Iteration order follows the enum declaration order of
+     * {@link PageLevel} regardless of the {@code Set} implementation
+     * passed in, so {@link Reading#elements()} is deterministic.
      */
-    private List<TextElement> extractAllLevels() {
+    private List<TextElement> extractLevels(Set<PageLevel> levels) {
         List<TextElement> out = new ArrayList<>();
+        if (levels.isEmpty()) {
+            return out;
+        }
         for (PageLevel level : PageLevel.values()) {
+            if (!levels.contains(level)) {
+                continue;
+            }
             Pointer iter = api.TessBaseAPIGetIterator(handle);
             if (iter == null) {
                 continue;
@@ -373,6 +422,7 @@ public final class Scribe implements AutoCloseable {
         private Path datapath;
         private String language;
         private PageSegMode pageSegMode = PageSegMode.AUTO;
+        private boolean pageSegModeApplied = true;
         private OcrEngineMode ocrEngineMode = OcrEngineMode.DEFAULT;
         private final Map<String, String> variables = new LinkedHashMap<>();
 
@@ -410,6 +460,23 @@ public final class Scribe implements AutoCloseable {
         public Builder pageSegMode(PageSegMode mode) {
             this.pageSegMode = Objects.requireNonNull(
                     mode, "pageSegMode cannot be null");
+            this.pageSegModeApplied = true;
+            return this;
+        }
+
+        /**
+         * Do not touch Tesseract's internal page segmentation mode at
+         * {@code build()} time — leave whatever value the library sets
+         * itself when its {@code TessBaseAPI*} is initialised.
+         *
+         * <p>Exists for consumers that need to preserve the historical
+         * "PSM = -1 means do not call {@code TessBaseAPISetPageSegMode}"
+         * sentinel (SikuliX legacy {@code OCR.Options.resetPSM()}).
+         * Regular callers do not need this — the default AUTO covers
+         * the common case.
+         */
+        public Builder pageSegModeUnset() {
+            this.pageSegModeApplied = false;
             return this;
         }
 
@@ -487,7 +554,11 @@ public final class Scribe implements AutoCloseable {
                         + ", oem=" + ocrEngineMode + ")");
             }
 
-            tessApi.TessBaseAPISetPageSegMode(h, pageSegMode.value());
+            if (pageSegModeApplied) {
+                tessApi.TessBaseAPISetPageSegMode(h, pageSegMode.value());
+            }
+            // else: leave whatever Tesseract initialised itself with,
+            //       as requested via Builder.pageSegModeUnset().
 
             for (Map.Entry<String, String> e : variables.entrySet()) {
                 // SetVariable returns BOOL: 0 means the variable name
