@@ -1,0 +1,38 @@
+# Maven
+target/
+.flattened-pom.xml
+dependency-reduced-pom.xml
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# NetBeans
+nbproject/
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# JVM crash dumps
+hs_err_pid*.log
+replay_pid*.log
+core.*
+
+# Local test override (native lib paths per developer)
+*.local.properties
+octachorix.test.local
