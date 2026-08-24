@@ -1,0 +1,677 @@
+=============================================================================
+  OCTACHORIX  -  DOSSIER D'ARCHITECTURE  V2
+  Draft 2026-08-23 - decisions Julien tranchees, pret pour ecriture code
+=============================================================================
+
+Objet : figer les decisions d'architecture AVANT ecriture de la moindre
+        ligne de code. Ce fichier reste dans le repo comme trace de
+        conception et sert de reference (tout ce qui est ici vient
+        de nos discussions et de la revue publique de la C API Tesseract,
+        jamais du code source .java de tess4j).
+
+
+-----------------------------------------------------------------------------
+  DECISIONS V2  (Julien 2026-08-23)
+-----------------------------------------------------------------------------
+
+  [Q1] Hypercube : NOM CONFIRME
+  [Q2] Package Java : org.oculix.octachorix  (aligne wayland-robot-java,
+       plus court et sans underscore que io.github.oculix_org)
+  [Q3] Ajout methode withLanguage(String) sur Scribe -> retourne un
+       NOUVEAU Scribe partageant les natives (meme Hypercube JNA cache)
+       mais avec son propre handle TessBaseAPI* configure sur la nouvelle
+       langue. Scribe reste immuable. Motive par le cas OculiX qui
+       switch souvent (eng/fra/spa/chi_sim/hin).
+  [Q4] Reading arbre PLAT (comme tess4j)
+  [Q5] Ecriture d'un coup, par groupes logiques methode Sol
+  [Q6] Version 0.1.0-SNAPSHOT (peu importe, pas de publish V1)
+  [Q7] Test integration natif OBLIGATOIRE V1
+  [Q8] CLA style FSF (Contributor Assignment Agreement)
+  [Q9] ImageBridge : classe utility statique, appelee par Scribe.read()
+       en interne, convertit BufferedImage -> PixelBuffer pour
+       TessBaseAPISetImage.
+
+  Ajout doctrine dev : methode Sol appliquee a l'ecriture (1 fichier
+  ecrit + relecture verdict + fichier suivant, jamais confiance en
+  ce que je produis, je me relis).
+
+
+-----------------------------------------------------------------------------
+  CHANGELOG V0 -> V1  (revue GPT-Sol - conserve pour trace)
+-----------------------------------------------------------------------------
+
+  [1]  "Clean-room strict" -> "Independent implementation against upstream
+       Tesseract C API. No tess4j source code is copied or adapted."
+  [2]  Retire l'affirmation "fuite memoire potentielle" cote tess4j
+  [3]  "un seul appel natif" -> "UNE SEULE PASSE DE RECONNAISSANCE OCR"
+  [4]  Retire l'affirmation "immuable = thread-safe" - Scribe reste
+       immuable mais explicitement NON thread-safe
+  [5]  TessBaseAPIInit3 remplace par TessBaseAPIInit2 (Init2 prend l'OEM)
+  [6]  Word renomme en TextElement
+  [7]  Ajout section 4.8 ImageBridge - conversion BufferedImage
+  [8]  NativeBond simplifie : bind(Path, Class<T>, options)
+  [9]  Test integration natif obligatoire des V1
+  [10] Section 8 positionnement : tess4j = wrapper generaliste,
+       Octachorix = runtime deterministe session-oriented geometry-first
+
+
+-----------------------------------------------------------------------------
+1. POURQUOI OCTACHORIX EXISTE
+-----------------------------------------------------------------------------
+
+1.1  Le probleme mesure (Legerix issue #20, CI matrix run 32606359921)
+
+     La memory map du hs_err complet montre DEUX libtesseract mappees
+     simultanement sur Ubuntu + apt tesseract :
+       - notre bundle  : ~/.cache/legerix/.../libtesseract.so.5      (5.5.0)
+       - le systeme   : /usr/lib/x86_64-linux-gnu/libtesseract.so.5.0.3
+
+     Le journal JVM enregistre juste avant le crash :
+       UnsatisfiedLinkError: libtesseract.so: cannot open shared object
+       UnsatisfiedLinkError: libleptonica.so: cannot open shared object
+
+     C'est JNA qui cherche le nom exact non-versionne dans nos dirs, echoue
+     (on ne ship que .so.5 et .so.6), puis bascule sur matchLibrary() qui
+     scanne le pool fusionne (nos dirs + /usr/lib) et pick le max de version.
+     "5.0.3" > "5" -> le systeme gagne.
+
+     Le tesseract systeme est compile contre Leptonica 1.82.
+     Notre Leptonica embarquee est 1.87.
+     Struct Pix incompatible -> SIGSEGV pixDestroy des le premier cross.
+
+1.2  Ce que tess4j fait et pourquoi ca ne suffit pas
+
+     Verifie sur tess4j 5.18.0 et 5.20.0 (sources publiques GitHub) :
+
+       - LIB_NAME_NON_WIN = "tesseract"  (constante hardcodee)
+       - TessAPI.INSTANCE  (static final, init au classload)
+       - getTessAPIInstance() fait Native.load(name, TessAPI.class)
+         -> resolution short-name par JNA sur Linux/macOS
+       - Aucun hook pour injecter un chemin absolu sur Unix
+       - Sur Windows uniquement, tess4j extrait sa DLL et binde absolu
+
+     Note importante : tess4j appelle dispose() dans les finally des
+     operations publiques, et dispose() invoque bien TessBaseAPIDelete.
+     Il n'y a PAS de fuite memoire chronique. Ce que tess4j n'expose
+     pas, c'est un objet-session persistant dont le lifecycle est
+     controle par le consommateur - il refait init/dispose autour de
+     chaque doOCR/getWords.
+
+     Aucune quantite de patchelf cote Legerix ne peut compenser le
+     probleme de resolution short-name.
+
+1.3  Ce qu'on gagne a ecrire notre propre couche
+
+     - Chargement chemin absolu STRICT -> #20 meurt par construction
+     - Un seul consumer moderne pour Legerix et OculiX -> plus de tess4j
+     - Session persistante reutilisable avec lifecycle explicite
+       (AutoCloseable) -> le consumer choisit quand init et delete
+     - UNE SEULE PASSE DE RECONNAISSANCE pour texte + geometrie +
+       confidences (au lieu de doOCR + getWords qui rerun recognition)
+     - API typee : enums pour PageSegMode/OcrEngineMode/PageLevel,
+       records pour les DTO, AutoCloseable pour la vie de la session
+     - Multi-langue fluide via scribe.withLanguage("fra") -> nouveau
+       Scribe partageant les natives, sans reconstruction complete
+     - Licence GPLv3 -> protection contre absorption commerciale silencieuse
+     - Nom, doctrine, structure sous notre controle direct
+
+
+-----------------------------------------------------------------------------
+2. CONTRAINTES NON-NEGOCIABLES
+-----------------------------------------------------------------------------
+
+2.1  Licence GPL v3
+     Modele iText/TigerVNC. Copyleft fort. Compatible dual-license
+     commerciale future si un consommateur B2B demande une variante
+     non-GPL. Ne PAS choisir Apache/MIT : la brique doit etre protegee.
+
+     Consequence sur les contributions externes (Q8 tranchee) :
+     Contributor Assignment Agreement (CAA) style FSF, pas simple CLA.
+     Le contributeur assigne les droits patrimoniaux au projet, ce qui
+     permet le relicensing commercial ulterieur sans avoir a re-solliciter
+     chaque tiers. Fichier CONTRIBUTING.md a la racine du repo, avec
+     texte du CAA a signer avant tout PR accepte.
+
+2.2  Independent implementation
+
+     "Independent implementation against the upstream Tesseract C API.
+      No tess4j source code is copied or adapted."
+
+     Concretement :
+       - Les mappings JNA sont ecrits contre capi.h upstream Tesseract
+         (docs C publiques -> signatures de fonctions = faits non
+          protegeables par copyright)
+       - La Javadoc PUBLIQUE de tess4j peut etre lue uniquement pour
+         connaitre les NOMS de methodes que nos consumers attendent
+         (setDatapath, doOCR, getWords) - le nom, jamais le corps
+       - Le code source .java de tess4j n'est pas ouvert pendant
+         l'ecriture d'Octachorix
+
+     Note juridique : Apache-2.0 (tess4j) est compatible GPLv3 dans
+     le sens Apache -> GPLv3, donc rien n'interdit legalement de
+     reprendre du code tess4j sous GPLv3. Le choix "independent
+     implementation" est un choix de propriete intellectuelle du
+     projet, pas une contrainte de licence.
+
+2.3  Chargement chemin absolu STRICT
+     - NativeBond.bind(pathAbsolu, api, opts) uniquement
+     - Sur Linux : RTLD_LAZY | RTLD_GLOBAL via JNA OPTION_OPEN_FLAGS
+     - Sur macOS : NativeLibrary.getInstance(pathAbsolu, opts)
+     - Sur Windows : NativeLibrary.getInstance(pathAbsolu, opts)
+                     + SetDllDirectoryW pour les deps siblings (Windows only)
+     - Fail loud si le fichier n'existe pas au chemin donne
+     - JAMAIS de Native.load("tesseract") ni de short-name resolution
+     - JAMAIS de fallback sur PATH / LD_LIBRARY_PATH / /usr/lib
+     - Un seul mecanisme de chargement par OS
+     - L'appelant fournit le chemin. Legerix le fournira. Point.
+
+2.4  Zero dependance runtime a tess4j
+     - Rien dans le pom.xml
+     - Rien dans les imports
+     - Meme les tests unitaires n'importent pas tess4j
+     - Pas d'artefact Maven qui tire tess4j en transitif
+
+2.5  Methode Sol appliquee a l'ecriture (V2)
+     - 1 fichier ecrit -> je le relis -> verdict compile mentalement OK
+       -> j'ecris le suivant
+     - Jamais 10 fichiers d'un coup sans relecture
+     - Chaque groupe logique (voir section 7 pour l'ordre) fait l'objet
+       d'un verdict avant de passer au groupe suivant
+     - Si un test/fichier resiste, experience isolee sur le point precis
+       avant de continuer
+     - Julien peut interrompre entre chaque groupe
+
+
+-----------------------------------------------------------------------------
+3. DECISIONS DEJA VALIDEES
+-----------------------------------------------------------------------------
+
+     Chemin local          : C:\Users\DELL\Octachorix
+     Licence               : GPL v3
+     Coordonnees Maven     : io.github.oculix-org : octachorix
+     Package Java          : org.oculix.octachorix
+     Baseline JDK          : 17
+     Tests V1              : unit + integration native obligatoire
+     API surface           : tess4j-like en intention, immuable +
+                             withLanguage() pour le multi-langue
+     TextRecognizer.optimize : reste cote OculiX, PAS dans Octachorix
+                               Octachorix recoit BufferedImage tel quel
+     Version               : 0.1.0-SNAPSHOT
+     Contributions         : CAA FSF-style
+
+
+-----------------------------------------------------------------------------
+4. ARCHITECTURE DES CLASSES
+-----------------------------------------------------------------------------
+
+4.1  Vue d'ensemble
+
+     Consumer                                     Octachorix
+     --------                                     ----------
+     Legerix / OculiX                             Scribe   (facade, session)
+        |                                              |
+        |                                              v
+        |                                        ImageBridge (BufferedImage
+        |                                                     -> PixelBuffer)
+        |                                              |
+        v                                              v
+     try (Scribe s = ...) {  ------------------> Hypercube (JNA bindings)
+        s.read(bimg)                                   |
+        Scribe fr = s.withLanguage("fra")              v
+        fr.read(bimg2)                          NativeBond (loader
+     }                                                  chemin absolu)
+                                                       |
+                                                       v
+                                                libtesseract.so.5
+                                                (chemin absolu FOURNI
+                                                 par le consumer)
+
+4.2  NativeBond  (le loader - contrat generique)
+
+     Role : charger UNE lib native par chemin absolu et retourner
+            directement une interface JNA bindee. Un seul point qui
+            maitrise chemin + flags.
+
+     public final class NativeBond {
+         private NativeBond() {}
+
+         /**
+          * Charge la bibliotheque au chemin absolu specifie et
+          * retourne une instance de l'interface JNA passee en parametre.
+          *
+          * Un seul mecanisme de chargement par OS. Pas de fallback sur
+          * short-name, PATH, LD_LIBRARY_PATH, /usr/lib.
+          */
+         public static <T extends Library> T bind(
+             Path absolutePath,
+             Class<T> apiClass,
+             Map<String, ?> options
+         );
+
+         /** Surcharge sans options - defaults corrects par OS. */
+         public static <T extends Library> T bind(
+             Path absolutePath,
+             Class<T> apiClass
+         );
+     }
+
+     Contrat :
+       - Path absolu obligatoire (assert isAbsolute, sinon OctachorixFault)
+       - Fichier doit exister (Files.isRegularFile) - sinon OctachorixFault
+       - Sur Linux : options par defaut = {OPEN_FLAGS: RTLD_LAZY|RTLD_GLOBAL}
+       - Sur macOS/Windows : options par defaut = {}
+       - Retourne l'interface JNA prete a l'emploi
+       - Note : JNA cache NativeLibrary.getInstance() par path - deux
+         appels avec le meme path retournent le meme handle sous-jacent,
+         zero double load
+
+     Usage :
+       Hypercube api = NativeBond.bind(
+           cacheDir.resolve("libtesseract.so.5"),
+           Hypercube.class
+       );
+
+4.3  Hypercube  (les bindings JNA - Init2 prend l'OEM)
+
+     Role : declarer la surface C de Tesseract (capi.h) en Java, comme
+            interface JNA. Rien de plus. Aucune logique.
+
+     public interface Hypercube extends Library {
+         // ---- Lifecycle ----
+         Pointer TessBaseAPICreate();
+         void    TessBaseAPIDelete(Pointer handle);
+
+         /** Init2 prend l'OEM en 4e argument (Init3 ne l'a pas). */
+         int     TessBaseAPIInit2(Pointer handle, String datapath,
+                                  String language, int oem);
+         void    TessBaseAPIEnd(Pointer handle);
+
+         // ---- Config ----
+         int     TessBaseAPISetVariable(Pointer handle,
+                                        String name, String value);
+         void    TessBaseAPISetPageSegMode(Pointer handle, int mode);
+
+         // ---- Image ----
+         void    TessBaseAPISetImage(Pointer handle, byte[] data,
+                                     int width, int height,
+                                     int bytesPerPixel, int bytesPerLine);
+         void    TessBaseAPISetRectangle(Pointer handle, int left, int top,
+                                         int width, int height);
+
+         // ---- Recognition (LA seule passe couteuse) ----
+         int     TessBaseAPIRecognize(Pointer handle, Pointer monitor);
+
+         // ---- Extraction texte plein ----
+         Pointer TessBaseAPIGetUTF8Text(Pointer handle);
+         void    TessDeleteText(Pointer text);
+
+         // ---- Extraction geometrie + confidences ----
+         Pointer TessBaseAPIGetIterator(Pointer handle);
+         void    TessResultIteratorDelete(Pointer iter);
+         boolean TessPageIteratorNext(Pointer iter, int level);
+         Pointer TessResultIteratorGetUTF8Text(Pointer iter, int level);
+         float   TessResultIteratorConfidence(Pointer iter, int level);
+         boolean TessPageIteratorBoundingBox(Pointer iter, int level,
+                                             IntByReference left,
+                                             IntByReference top,
+                                             IntByReference right,
+                                             IntByReference bottom);
+
+         // ---- Meta ----
+         String  TessVersion();
+     }
+
+     Un seul endroit ou grep si on cherche "toutes les fonctions
+     natives declarees".
+
+4.4  Scribe  (la facade - immuable + withLanguage pour multi-langue)
+
+     Role : session Tesseract configuree, reutilisable pour N lectures,
+            AutoCloseable pour liberer proprement le handle natif.
+            Configuration figee au build ; changer de langue = nouveau
+            Scribe partageant les natives (withLanguage).
+
+     public final class Scribe implements AutoCloseable {
+
+         // Construction uniquement par builder
+         public static Builder builder();
+
+         // API principale (peut etre appelee N fois sur la meme session)
+         public Reading read(BufferedImage image);
+         public Reading read(BufferedImage image, Rectangle roi);
+
+         /**
+          * Q3 - Multi-langue OculiX.
+          * Retourne un NOUVEAU Scribe partageant les memes libs natives
+          * (Hypercube instance, tesseract lib, leptonica lib) mais avec
+          * son PROPRE handle TessBaseAPI* configure sur la langue passee.
+          * Les autres options (datapath, PSM, OEM, variables) sont
+          * heritees du Scribe courant.
+          *
+          * Chaque Scribe retourne par withLanguage() doit etre close()
+          * independamment. Les libs natives restent chargees tant qu'au
+          * moins un Scribe les utilise (cache JNA par path).
+          */
+         public Scribe withLanguage(String language);
+
+         // Lifecycle
+         @Override public void close();  // -> TessBaseAPIDelete, idempotent
+         public boolean isClosed();
+
+         // Meta
+         public String tesseractVersion();
+         public String language();
+
+         // ---
+         public static final class Builder {
+             public Builder tesseractLibrary(Path absolutePath);   // requis
+             public Builder leptonicaLibrary(Path absolutePath);   // requis
+             public Builder datapath(Path tessdataDir);            // requis
+             public Builder language(String lang);                 // requis
+             public Builder pageSegMode(PageSegMode mode);         // optionnel
+             public Builder ocrEngineMode(OcrEngineMode mode);     // optionnel
+             public Builder variable(String key, String value);    // repetable
+             public Scribe build();
+         }
+     }
+
+     Contrat thread-safety :
+
+       SCRIBE N'EST PAS THREAD-SAFE.
+
+       Le handle TessBaseAPI* est un etat natif mutable. Sequence :
+         SetImage(handle, imageA) ; Recognize(handle) ; GetUTF8Text(handle)
+
+       Deux threads utilisant le meme Scribe se marchent dessus.
+       Regle : un Scribe par thread concurrent. Pour un pool, allouer
+       N Scribes. L'usage OculiX actuel (thread principal + sessions
+       VNC per-thread) est deja compatible.
+
+     Notes :
+       - Le builder valide TOUT au moment de build() (fail-fast au boot)
+       - close() est idempotent et libere le handle via TessBaseAPIDelete
+       - withLanguage() cree un nouveau Scribe SANS toucher au courant :
+         les deux vivent en parallele, chacun peut etre close() ou reutilise
+
+4.5  Reading + TextElement  (les DTO - arbre plat)
+
+     Reading = ce que retourne scribe.read().
+     Une seule passe de RECONNAISSANCE (TessBaseAPIRecognize) produit
+     l'ensemble ; les appels iterator/GetUTF8Text/Confidence/BoundingBox
+     qui suivent parcourent le meme resultat sans re-reconnaissance.
+
+     public record Reading(
+         String text,
+         List<TextElement> elements
+     ) {
+         /** Filtre l'arbre plat sur un niveau de segmentation. */
+         public List<TextElement> elements(PageLevel level);
+     }
+
+     public record TextElement(
+         String text,
+         float confidence,       // 0.0 - 100.0
+         Rectangle bbox,
+         PageLevel level         // BLOCK, PARAGRAPH, TEXTLINE, WORD, SYMBOL
+     ) {}
+
+     public enum PageLevel {
+         BLOCK,
+         PARAGRAPH,
+         TEXTLINE,
+         WORD,
+         SYMBOL;
+         public int value();  // valeur C attendue par TessResultIterator
+     }
+
+     Notes :
+       - Records Java (JDK 17+), immuables par nature
+       - Reading.elements(PageLevel) filtre l'arbre plat deja calcule
+         (plusieurs parcours d'iterator natif necessaires pour les 5
+         niveaux, mais AUCUNE reconnaissance supplementaire)
+       - TextElement contient DEJA son level -> le consumer sait ce qu'il tient
+       - Rectangle = java.awt.Rectangle (deja utilise par TextRecognizer,
+         zero conversion cote OculiX)
+
+4.6  OctachorixFault  (l'exception)
+
+     Une seule exception pour tout. RuntimeException (les erreurs OCR
+     natives sont rarement recuperables gracieusement, fail loud au bon
+     niveau).
+
+     public final class OctachorixFault extends RuntimeException {
+         public OctachorixFault(String message);
+         public OctachorixFault(String message, Throwable cause);
+     }
+
+4.7  Enums typees  (PageSegMode / OcrEngineMode)
+
+     public enum PageSegMode {
+         OSD_ONLY(0), AUTO_OSD(1), AUTO_ONLY(2), AUTO(3),
+         SINGLE_COLUMN(4), SINGLE_BLOCK_VERT_TEXT(5), SINGLE_BLOCK(6),
+         SINGLE_LINE(7), SINGLE_WORD(8), CIRCLE_WORD(9),
+         SINGLE_CHAR(10), SPARSE_TEXT(11), SPARSE_TEXT_OSD(12),
+         RAW_LINE(13);
+         public int value();
+     }
+
+     public enum OcrEngineMode {
+         TESSERACT_ONLY(0),
+         LSTM_ONLY(1),
+         TESSERACT_LSTM_COMBINED(2),
+         DEFAULT(3);
+         public int value();
+     }
+
+4.8  ImageBridge  (conversion BufferedImage -> PixelBuffer)
+
+     Role : canonicaliser un java.awt.image.BufferedImage vers le format
+            attendu par TessBaseAPISetImage(data, w, h, bpp, bpl).
+
+     Pourquoi cette classe existe : un BufferedImage peut etre
+     TYPE_INT_RGB, TYPE_INT_ARGB, TYPE_3BYTE_BGR, grayscale, indexed,
+     custom raster. TessBaseAPISetImage attend un buffer coherent
+     (bytes/pixel, bytes/ligne, ordre BGR ou RGB).
+
+     tess4j delegue actuellement cette conversion a lept4j (via Pix).
+     Octachorix vire lept4j cote Java -> il faut faire la conversion
+     nous-memes.
+
+     public final class ImageBridge {
+         private ImageBridge() {}
+
+         /**
+          * Convertit un BufferedImage en buffer canonique
+          * pret pour TessBaseAPISetImage.
+          *
+          * Supporte : TYPE_INT_RGB, TYPE_INT_ARGB, TYPE_3BYTE_BGR,
+          *            TYPE_BYTE_GRAY, TYPE_USHORT_GRAY (converti en byte).
+          * Les autres types sont convertis via getRGB() (plus lent).
+          */
+         public static PixelBuffer canonicalize(BufferedImage image);
+     }
+
+     public record PixelBuffer(
+         byte[] data,
+         int width,
+         int height,
+         int bytesPerPixel,     // 1 (grayscale) ou 3 (RGB) ou 4 (RGBA)
+         int bytesPerLine       // = width * bytesPerPixel dans le cas simple
+     ) {}
+
+
+-----------------------------------------------------------------------------
+5. EXEMPLE D'USAGE COTE CONSUMER
+-----------------------------------------------------------------------------
+
+     // Legerix ou OculiX, apres extraction des natives dans le cache
+
+     try (Scribe english = Scribe.builder()
+             .tesseractLibrary(cacheDir.resolve("libtesseract.so.5"))
+             .leptonicaLibrary(cacheDir.resolve("libleptonica.so.6"))
+             .datapath(cacheDir.resolve("tessdata"))
+             .language("eng")
+             .pageSegMode(PageSegMode.SPARSE_TEXT)
+             .ocrEngineMode(OcrEngineMode.LSTM_ONLY)
+             .variable("tessedit_char_whitelist", "0123456789")
+             .build()) {
+
+         // Premiere lecture en anglais
+         Reading r1 = english.read(bufferedImage);
+         String text = r1.text();
+         List<TextElement> words = r1.elements(PageLevel.WORD);
+
+         // Multi-langue OculiX - Q3 - nouveau Scribe partageant les natives
+         try (Scribe french = english.withLanguage("fra")) {
+             Reading r2 = french.read(otherImage);
+             // ...
+         }
+         // le Scribe english reste utilisable pendant ce temps
+         Reading r3 = english.read(thirdImage);
+     }
+     // close() automatique -> TessBaseAPIDelete pour english
+
+
+-----------------------------------------------------------------------------
+6. DIFFERENCES DELIBEREES vs tess4j
+-----------------------------------------------------------------------------
+
+     Aspect                        tess4j                   Octachorix
+     ------                        ------                   ----------
+     Construction                  new + setters mutables   Builder immuable
+     Session persistante           non (init/dispose op)    oui (Scribe)
+     Cycle lifecycle               automatique interne      explicite AutoCloseable
+     Multi-langue                  setLanguage() sur meme t withLanguage() -> new Scribe
+     Thread-safety cote Scribe     n/a                      NON (un par thread)
+     text + geometry               2 recognition passes     1 recognition pass
+     PSM/OEM                       int magiques             enum type
+     Chargement natif Unix         Native.load short-name   chemin absolu STRICT
+     Interfaces                    ITesseract + 2 impls     Scribe final unique
+     Conversion BufferedImage      via lept4j (Pix)         ImageBridge direct
+     Windows-only DLL bundlee      oui                      non (Legerix s'en charge)
+     PDF searchable                oui                      non (out of scope V1)
+     TIFF multipage                oui                      non (out of scope V1)
+     OSD detection                 oui                      non (out of scope V1)
+     Renderers hOCR/ALTO/TSV       oui                      non (out of scope V1)
+     Licence                       Apache-2.0               GPL v3
+     Contributions                 CLA classique            CAA style FSF
+     Lignes de code                ~9k (dont doublons)      cible ~2-3k V1
+
+
+-----------------------------------------------------------------------------
+7. STRUCTURE DU REPO + ORDRE D'ECRITURE (methode Sol par groupes)
+-----------------------------------------------------------------------------
+
+     Octachorix/
+       ARCHITECTURE.txt            (ce fichier)
+       LICENSE                     (GPL v3 complete)
+       README.md                   (planted flag, court)
+       CONTRIBUTING.md             (CAA FSF-style)
+       .gitignore                  (Maven, IDE, OS)
+       pom.xml                     (JDK 17, JNA 5.14, JUnit 5, sans tess4j)
+
+       src/main/java/org/oculix/octachorix/
+         package-info.java         (mission + reference a capi.h upstream)
+         Scribe.java               (facade + Builder inner class)
+         Reading.java              (record)
+         TextElement.java          (record)
+         PageLevel.java            (enum 5 valeurs)
+         PageSegMode.java          (enum 14 valeurs)
+         OcrEngineMode.java        (enum 4 valeurs)
+         Hypercube.java            (interface JNA, bindings capi.h)
+         NativeBond.java           (loader chemin absolu strict)
+         ImageBridge.java          (BufferedImage -> PixelBuffer)
+         PixelBuffer.java          (record raw pixel data)
+         OctachorixFault.java      (RuntimeException)
+
+       src/test/java/org/oculix/octachorix/
+         NativeBondTest.java       (assert path absolu, fichier existant,
+                                    refus des short names, refus paths null)
+         ScribeBuilderTest.java    (validation champs requis, fail-fast)
+         ImageBridgeTest.java      (5 TYPE_XXX + fallback getRGB())
+
+       src/test/java/org/oculix/octachorix/integration/
+         ScribeNativeRoundTripTest.java
+             (test integration natif OBLIGATOIRE V1)
+             - Recoit paths natifs via -Doctachorix.test.libs=/path
+               (skip si absent, ne casse pas build hors CI equipe)
+             - Charge tesseract + leptonica
+             - Init sur tessdata reel
+             - Reconnaissance image synthetique connue
+             - Verifie text + words + confidence > seuil
+         ScribeSystemInterferenceTest.java
+             (LE test central Legerix#20)
+             - Contexte : tesseract systeme apt present + Octachorix fourni
+             - Preuve : seul le moteur au chemin fourni est utilise
+             - Assertion : version reportee == version bundle, pas systeme
+
+     PLUS TARD (pas V1) :
+       .github/workflows/ci.yml       (matrix JDK 17/21 x OS)
+       .github/workflows/release.yml  (publish Maven Central)
+
+     ORDRE D'ECRITURE (par groupes, verdict entre chaque) :
+
+       Groupe 1 - Infra projet (5 fichiers)
+         1. pom.xml
+         2. .gitignore
+         3. README.md
+         4. CONTRIBUTING.md
+         5. LICENSE
+
+       Groupe 2 - Base Java pure (7 fichiers)
+         6. package-info.java
+         7. OctachorixFault.java
+         8. PageLevel.java
+         9. PageSegMode.java
+         10. OcrEngineMode.java
+         11. PixelBuffer.java
+         12. TextElement.java
+
+       Groupe 3 - Type compose (1 fichier)
+         13. Reading.java
+
+       Groupe 4 - Natives (3 fichiers, dependent de JNA)
+         14. Hypercube.java
+         15. NativeBond.java
+         16. ImageBridge.java
+
+       Groupe 5 - Facade (1 fichier, depend de tout)
+         17. Scribe.java
+
+       Groupe 6 - Tests (4-5 fichiers)
+         18. NativeBondTest.java
+         19. ImageBridgeTest.java
+         20. ScribeBuilderTest.java
+         21. ScribeNativeRoundTripTest.java (integration, skip si -D absent)
+         22. ScribeSystemInterferenceTest.java (le theoreme #20)
+
+     Total ~22 fichiers. Julien peut interrompre entre chaque groupe.
+
+
+-----------------------------------------------------------------------------
+8. POSITIONNEMENT PUBLIC
+-----------------------------------------------------------------------------
+
+     Octachorix V1 ne sera PAS "plus complet que tess4j".
+     Il sera au contraire beaucoup plus etroit en fonctionnalites
+     generales (pas de PDF, pas de TIFF multipage, pas d'OSD, pas de
+     renderers, pas de bundling DLL Windows).
+
+     Mais pour l'usage cible - OCR programmatique, automation visuelle,
+     JVM, natives controlees - il sera nettement mieux architecture.
+
+     Formulation publique a tenir :
+
+       tess4j      = wrapper Java mature et generaliste de Tesseract
+       Octachorix  = runtime Tesseract JVM deterministe,
+                     session-oriented, geometry-first
+
+
+-----------------------------------------------------------------------------
+FIN DU DOCUMENT
+-----------------------------------------------------------------------------
+
+Prochain pas :
+  1. Julien relit ce V2 corrige
+  2. Sur son GO, ecriture Groupe 1 (5 fichiers infra projet)
+  3. Verdict Julien apres chaque groupe, puis groupe suivant
