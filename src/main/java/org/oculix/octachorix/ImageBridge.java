@@ -9,8 +9,11 @@
 package org.oculix.octachorix;
 
 import java.awt.image.BufferedImage;
+import java.awt.image.ComponentSampleModel;
 import java.awt.image.DataBufferByte;
 import java.awt.image.DataBufferUShort;
+import java.awt.image.SampleModel;
+import java.awt.image.WritableRaster;
 import java.util.Objects;
 
 /**
@@ -86,32 +89,43 @@ public final class ImageBridge {
     }
 
     /**
-     * Fast path for {@link BufferedImage#TYPE_BYTE_GRAY}: the raster's
-     * underlying {@link DataBufferByte} is already the raw byte-per-pixel
-     * grayscale buffer Tesseract wants. We defensively copy so that a
-     * subsequent mutation of the source image cannot corrupt the buffer
-     * we hand out.
+     * Fast path for {@link BufferedImage#TYPE_BYTE_GRAY}: when the raster
+     * is compact and contiguous (no translation, one byte per pixel, no
+     * per-line padding), the underlying {@link DataBufferByte} is already
+     * the raw byte-per-pixel grayscale buffer Tesseract wants and we can
+     * defensively copy it directly.
+     *
+     * <p>For a {@link BufferedImage#getSubimage subimage} the raster is
+     * NOT compact — it shares the parent's buffer with a non-zero
+     * translation and the parent's scanline stride. In that case we fall
+     * back to the safe {@link #fallbackRgb} path rather than reading the
+     * wrong pixels or overflowing the parent buffer.
      */
     private static PixelBuffer fastByteGray(BufferedImage image,
                                             int width, int height) {
+        if (!isCompactRaster(image, 1)) {
+            return fallbackRgb(image, width, height);
+        }
         DataBufferByte db = (DataBufferByte) image.getRaster().getDataBuffer();
         byte[] shared = db.getData();
         byte[] copy = new byte[width * height];
-        // Straight copy: TYPE_BYTE_GRAY has no per-line padding beyond
-        // the pixel width in the standard Java raster layout.
         System.arraycopy(shared, 0, copy, 0, copy.length);
         return new PixelBuffer(copy, width, height, 1, width);
     }
 
     /**
-     * Fast path for {@link BufferedImage#TYPE_USHORT_GRAY}: the raster
-     * stores one unsigned 16-bit value per pixel. Tesseract only speaks
-     * 8-bit-per-channel, so we downscale by shifting right 8 bits
-     * ({@code value >>> 8}), which is the standard 16-to-8-bit
-     * grayscale conversion.
+     * Fast path for {@link BufferedImage#TYPE_USHORT_GRAY}: when the
+     * raster is compact, one unsigned 16-bit value per pixel, downscaled
+     * to 8 bits by right-shift ({@code value >>> 8}).
+     *
+     * <p>Same compact-raster guard as {@link #fastByteGray} — a subimage
+     * of a {@code TYPE_USHORT_GRAY} parent falls back to the safe path.
      */
     private static PixelBuffer fastUshortGray(BufferedImage image,
                                               int width, int height) {
+        if (!isCompactRaster(image, 1)) {
+            return fallbackRgb(image, width, height);
+        }
         DataBufferUShort db = (DataBufferUShort) image.getRaster().getDataBuffer();
         short[] src = db.getData();
         int pixels = width * height;
@@ -121,6 +135,44 @@ public final class ImageBridge {
             dst[i] = (byte) (v >>> 8);
         }
         return new PixelBuffer(dst, width, height, 1, width);
+    }
+
+    /**
+     * Returns {@code true} when the image's raster is compact and
+     * contiguous — the layout the fast paths assume.
+     *
+     * <p>Compact means: no translation between the sample model and the
+     * raster origin, a {@link ComponentSampleModel} with one band and
+     * one byte (or one sample) per pixel, no per-line padding beyond
+     * the pixel width, and a single band offset of zero.
+     *
+     * <p>A subimage produced by {@link BufferedImage#getSubimage} is not
+     * compact: it inherits the parent's data buffer but exposes only a
+     * cropped view, so {@code DataBufferByte.getData()} still returns
+     * the parent's full buffer.
+     */
+    private static boolean isCompactRaster(BufferedImage image,
+                                           int expectedPixelStride) {
+        WritableRaster raster = image.getRaster();
+        SampleModel sm = raster.getSampleModel();
+        if (raster.getSampleModelTranslateX() != 0
+                || raster.getSampleModelTranslateY() != 0) {
+            return false;
+        }
+        if (!(sm instanceof ComponentSampleModel csm)) {
+            return false;
+        }
+        if (csm.getNumBands() != 1) {
+            return false;
+        }
+        if (csm.getPixelStride() != expectedPixelStride) {
+            return false;
+        }
+        if (csm.getScanlineStride() != image.getWidth() * expectedPixelStride) {
+            return false;
+        }
+        int[] offsets = csm.getBandOffsets();
+        return offsets.length == 1 && offsets[0] == 0;
     }
 
     /**
