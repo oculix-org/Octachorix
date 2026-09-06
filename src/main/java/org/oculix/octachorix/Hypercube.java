@@ -86,6 +86,20 @@ public interface Hypercube extends Library {
     int TessBaseAPIInit2(Pointer handle, String datapath, String language, int oem);
 
     /**
+     * Same as {@link #TessBaseAPIInit2} plus a list of Tesseract config
+     * file names ({@code "digits"}, {@code "quiet"}, ...) resolved by
+     * Tesseract against {@code <datapath>/configs/} and applied at
+     * initialisation.
+     *
+     * @param configs      config file names, {@code null} when
+     *                     {@code configsSize} is {@code 0}
+     * @param configsSize  number of entries in {@code configs}
+     * @return {@code 0} on success, non-zero on failure
+     */
+    int TessBaseAPIInit1(Pointer handle, String datapath, String language, int oem,
+                         String[] configs, int configsSize);
+
+    /**
      * Ends the recognition session for the current image and clears
      * any per-image state, but does not destroy the {@code TessBaseAPI*}
      * itself.
