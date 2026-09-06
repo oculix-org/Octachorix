@@ -1,0 +1,120 @@
+name: Build and release
+
+# Pure-Java artifact, no natives: compile, test against apt Tesseract, then
+# publish a GitHub release whose tag is derived from the pom version
+# (<revision>1.0.0</revision> -> v1.0.0). Same flow as Legerix, minus the
+# native staging. Maven Central comes after, from publish-maven-central.yml.
+#
+# Re-running on an existing tag re-uploads the assets in place (--clobber).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      # Legerix release whose natives + tessdata the tests run against: the
+      # one marked Latest on GitHub, the same OculiX depends on. Bump here.
+      LEGERIX_VERSION: 5.5.0-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # The unit tests need a real Tesseract + Leptonica reachable by absolute
+      # path. They run against the binaries Legerix ships — the ones OculiX
+      # actually uses — never against a system Tesseract. Same staging as
+      # interference-theorem.yml. Nothing from here ends up in the artifact.
+      - uses: actions/checkout@v4
+        with:
+          repository: oculix-org/Legerix
+          ref: v${{ env.LEGERIX_VERSION }}
+          path: legerix
+
+      - name: Stage Legerix natives (linux-x86-64) from the Latest Legerix release
+        run: |
+          mkdir -p natives
+          BASE="https://github.com/oculix-org/Legerix/releases/download/v${LEGERIX_VERSION}"
+          curl -fsSL -o natives/libtesseract.so.5 "$BASE/libtesseract.so.5-linux-x86-64"
+          curl -fsSL -o natives/libleptonica.so.6 "$BASE/libleptonica.so.6-linux-x86-64"
+          bash legerix/scripts/fetch-traineddata.sh tessdata
+
+      - name: Build and test
+        run: >
+          mvn -B verify
+          -DargLine="-Doctachorix.test.libs.tesseract=${{ github.workspace }}/natives/libtesseract.so.5
+          -Doctachorix.test.libs.leptonica=${{ github.workspace }}/natives/libleptonica.so.6
+          -Doctachorix.test.libs.tessdata=${{ github.workspace }}/tessdata"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            target/octachorix-*.jar
+            .flattened-pom.xml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Get version from pom
+        id: version
+        run: |
+          VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Prepare release assets
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          mkdir -p release-assets
+          cp dist/target/octachorix-${VERSION}.jar          release-assets/
+          cp dist/target/octachorix-${VERSION}-sources.jar  release-assets/
+          cp dist/target/octachorix-${VERSION}-javadoc.jar  release-assets/
+          cp dist/.flattened-pom.xml                        release-assets/octachorix-${VERSION}.pom
+          ls -lh release-assets/
+
+      - name: Create release if needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.VERSION }}"
+          PRERELEASE_FLAG=""
+          case "$TAG" in
+              *DO-NOT-USE*|*-rc[0-9]*|*-beta*|*-alpha*|*-SNAPSHOT*)
+                  PRERELEASE_FLAG="--prerelease"
+                  ;;
+          esac
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" $PRERELEASE_FLAG \
+              --title "Octachorix ${{ steps.version.outputs.VERSION }}" \
+              --notes "Deterministic, session-oriented Tesseract runtime for the JVM. Pure Java + JNA, binds libtesseract/libleptonica by absolute path only. Natives are not included: pair it with Legerix or point it at your own Tesseract 5.x."
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.VERSION }}"
+          gh release upload "$TAG" release-assets/* --clobber
