@@ -1,0 +1,53 @@
+name: Publish to Maven Central
+
+# Manual workflow, run AFTER the GitHub release exists (build.yml). Pure-Java
+# artifact: nothing to stage, straight `mvn deploy -P release`. The release
+# profile in pom.xml signs every artifact (GPG, org key) and hands the bundle
+# to the Central Publisher Portal with autoPublish. Secrets are org-level
+# (oculix-org): CENTRAL_USERNAME, CENTRAL_PASSWORD, GPG_PRIVATE_KEY,
+# GPG_PASSPHRASE. Same wiring as Legerix.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: GPG_PASSPHRASE
+
+      - name: Resolve version and refuse SNAPSHOT
+        run: |
+          VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "POM_VERSION=$VERSION" >> "$GITHUB_ENV"
+          case "$VERSION" in
+            *-SNAPSHOT) echo "ERROR: Central refuses SNAPSHOT versions ($VERSION)"; exit 1 ;;
+          esac
+          echo "Publishing octachorix $VERSION"
+
+      - name: Require the matching GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "v$POM_VERSION" > /dev/null \
+            || { echo "ERROR: GitHub release v$POM_VERSION does not exist — GitHub first, Central second"; exit 1; }
+
+      - name: Publish to Maven Central
+        run: mvn -B deploy -P release -DskipTests
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
