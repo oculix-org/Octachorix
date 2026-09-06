@@ -93,6 +93,7 @@ public final class Scribe implements AutoCloseable {
     private final PageSegMode pageSegMode;
     private final OcrEngineMode ocrEngineMode;
     private final Map<String, String> variables;
+    private final List<String> configs;
 
     // --- Native session state ---
     private final Hypercube api;
@@ -109,6 +110,7 @@ public final class Scribe implements AutoCloseable {
         this.pageSegMode = b.pageSegMode;
         this.ocrEngineMode = b.ocrEngineMode;
         this.variables = Map.copyOf(b.variables);
+        this.configs = List.copyOf(b.configs);
         this.api = api;
         this.handle = handle;
         this.closed = false;
@@ -250,6 +252,7 @@ public final class Scribe implements AutoCloseable {
         for (Map.Entry<String, String> e : variables.entrySet()) {
             b.variable(e.getKey(), e.getValue());
         }
+        b.configs(configs);
         return b.build();
     }
 
@@ -297,6 +300,11 @@ public final class Scribe implements AutoCloseable {
     /** Returns an unmodifiable view of the effective variables. */
     public Map<String, String> variables() {
         return variables;
+    }
+
+    /** Returns the Tesseract config file names applied at init, possibly empty. */
+    public List<String> configs() {
+        return configs;
     }
 
     // ------------------------------------------------------------------
@@ -425,6 +433,7 @@ public final class Scribe implements AutoCloseable {
         private boolean pageSegModeApplied = true;
         private OcrEngineMode ocrEngineMode = OcrEngineMode.DEFAULT;
         private final Map<String, String> variables = new LinkedHashMap<>();
+        private final List<String> configs = new ArrayList<>();
 
         private Builder() {
         }
@@ -499,6 +508,25 @@ public final class Scribe implements AutoCloseable {
         }
 
         /**
+         * Tesseract config file names ({@code "digits"}, {@code "quiet"},
+         * ...) applied at initialisation through {@code TessBaseAPIInit1}.
+         * Tesseract resolves each name against {@code <datapath>/configs/}.
+         * Replaces any list set before. An empty list means plain
+         * {@code TessBaseAPIInit2}.
+         */
+        public Builder configs(List<String> configFileNames) {
+            Objects.requireNonNull(configFileNames, "configs cannot be null");
+            configs.clear();
+            for (String c : configFileNames) {
+                if (c == null || c.isBlank()) {
+                    throw new OctachorixFault("config file name cannot be null or blank");
+                }
+                configs.add(c);
+            }
+            return this;
+        }
+
+        /**
          * Validates the configuration, preloads Leptonica (with
          * {@code RTLD_GLOBAL} on Linux so Tesseract's {@code NEEDED}
          * resolves against ours before the loader falls back to the
@@ -540,18 +568,34 @@ public final class Scribe implements AutoCloseable {
                         + "(library at " + tesseractLib + ")");
             }
 
-            int rc = tessApi.TessBaseAPIInit2(
-                    h,
-                    datapath.toAbsolutePath().toString(),
-                    language,
-                    ocrEngineMode.value());
+            int rc;
+            String initName;
+            if (configs.isEmpty()) {
+                initName = "TessBaseAPIInit2";
+                rc = tessApi.TessBaseAPIInit2(
+                        h,
+                        datapath.toAbsolutePath().toString(),
+                        language,
+                        ocrEngineMode.value());
+            } else {
+                initName = "TessBaseAPIInit1";
+                String[] names = configs.toArray(new String[0]);
+                rc = tessApi.TessBaseAPIInit1(
+                        h,
+                        datapath.toAbsolutePath().toString(),
+                        language,
+                        ocrEngineMode.value(),
+                        names,
+                        names.length);
+            }
             if (rc != 0) {
                 tessApi.TessBaseAPIDelete(h);
                 throw new OctachorixFault(
-                        "TessBaseAPIInit2 returned " + rc
+                        initName + " returned " + rc
                         + " (datapath=" + datapath
                         + ", language=" + language
-                        + ", oem=" + ocrEngineMode + ")");
+                        + ", oem=" + ocrEngineMode
+                        + (configs.isEmpty() ? "" : ", configs=" + configs) + ")");
             }
 
             if (pageSegModeApplied) {
