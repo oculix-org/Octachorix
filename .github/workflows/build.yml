@@ -57,6 +57,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist
+          # upload-artifact v4 skips dotfiles by default; .flattened-pom.xml
+          # is one, and it is the pom we publish.
+          include-hidden-files: true
           path: |
             target/octachorix-*.jar
             .flattened-pom.xml
