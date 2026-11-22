@@ -292,6 +292,41 @@ public final class Scribe implements AutoCloseable {
         return api.TessVersion();
     }
 
+    /** Codec name to one entry point it exports, for {@link #provenance()}. */
+    private static final Map<String, String> CODEC_SYMBOLS = Map.ofEntries(
+            Map.entry("png", "png_create_read_struct"),
+            Map.entry("jpeg", "jpeg_CreateDecompress"),
+            Map.entry("tiff", "TIFFClientOpen"),
+            Map.entry("webp", "WebPDecode"),
+            Map.entry("sharpyuv", "SharpYuvConvert"),
+            Map.entry("openjp2", "opj_create_decompress"),
+            Map.entry("gif", "DGifOpen"),
+            Map.entry("jbig", "jbg_dec_init"),
+            Map.entry("lerc", "lerc_decode"),
+            Map.entry("deflate", "libdeflate_alloc_decompressor"),
+            Map.entry("zstd", "ZSTD_decompress"),
+            Map.entry("lzma", "lzma_code"),
+            Map.entry("zlib", "inflate"));
+
+    /**
+     * Returns what the loader resolved for this session: the files that
+     * define Tesseract's, Leptonica's and each image codec's entry
+     * points as seen from the bound Tesseract, and the version of the
+     * Tesseract that answered. See {@link Provenance}.
+     */
+    public Provenance provenance() {
+        ensureOpen();
+        Map<String, Path> codecs = new LinkedHashMap<>();
+        CODEC_SYMBOLS.forEach((codec, symbol) -> NativeBond
+                .definingFile(tesseractLib, symbol)
+                .ifPresent(file -> codecs.put(codec, file)));
+        return new Provenance(
+                NativeBond.definingFile(tesseractLib, "TessVersion"),
+                NativeBond.definingFile(tesseractLib, "pixCreate"),
+                codecs,
+                api.TessVersion());
+    }
+
     /** Returns the language string this session was initialised on. */
     public String language() {
         return language;

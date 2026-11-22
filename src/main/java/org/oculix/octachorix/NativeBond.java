@@ -8,10 +8,13 @@
  */
 package org.oculix.octachorix;
 
+import com.sun.jna.Function;
 import com.sun.jna.Library;
+import com.sun.jna.Memory;
 import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
 import com.sun.jna.Platform;
+import com.sun.jna.Pointer;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -19,6 +22,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The absolute-path loader — the single point in Octachorix that binds
@@ -179,6 +183,40 @@ public final class NativeBond {
             throw new OctachorixFault(
                     "Unexpected failure preloading native library at "
                     + pathString, e);
+        }
+    }
+
+    /**
+     * Returns the file the dynamic loader reports as defining
+     * {@code symbol}, looked up through the handle of the library
+     * already loaded from {@code library}: that library first, then
+     * its dependency tree, which is where its own calls are answered.
+     *
+     * <p>Uses {@code dladdr}, which Linux and macOS both provide, taken
+     * from the symbols already in the process: nothing is loaded by
+     * name. Empty when the symbol is not reachable from that handle, or
+     * when the platform has no {@code dladdr} (Windows): empty, never
+     * the requested path.
+     */
+    static Optional<Path> definingFile(Path library, String symbol) {
+        try {
+            Pointer address = NativeLibrary
+                    .getInstance(validate(library), defaultOptions())
+                    .getFunction(symbol);
+            Function dladdr = NativeLibrary.getProcess().getFunction("dladdr");
+            // Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr.
+            Memory info = new Memory(4L * Native.POINTER_SIZE);
+            info.clear();
+            if (dladdr.invokeInt(new Object[] {address, info}) == 0) {
+                return Optional.empty();
+            }
+            Pointer name = info.getPointer(0);
+            String file = name == null ? null : name.getString(0);
+            return file == null || file.isEmpty()
+                    ? Optional.empty() : Optional.of(Path.of(file));
+        } catch (UnsatisfiedLinkError | RuntimeException e) {
+            // A diagnostic: it reports nothing rather than fail the caller.
+            return Optional.empty();
         }
     }
 

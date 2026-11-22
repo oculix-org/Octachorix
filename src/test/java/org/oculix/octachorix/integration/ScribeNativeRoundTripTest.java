@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.oculix.octachorix.PageLevel;
 import org.oculix.octachorix.PageSegMode;
+import org.oculix.octachorix.Provenance;
 import org.oculix.octachorix.Reading;
 import org.oculix.octachorix.Scribe;
 import org.oculix.octachorix.TextElement;
@@ -21,6 +22,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -121,6 +123,30 @@ class ScribeNativeRoundTripTest {
             Reading r3 = english.read(img);
             assertTrue(r3.text().toLowerCase().contains("octachorix"),
                     "parent Scribe must remain usable after child close()");
+        }
+    }
+
+    @Test
+    void provenanceNamesTheFilesThatAnswered() throws Exception {
+        assumeTrue(!System.getProperty("os.name", "").toLowerCase().contains("win"),
+                "dladdr is Linux/macOS only; Windows reports empty by design");
+
+        try (Scribe scribe = Scribe.builder()
+                .tesseractLibrary(tesseractLib)
+                .leptonicaLibrary(leptonicaLib)
+                .datapath(tessdata)
+                .language("eng")
+                .build()) {
+
+            Provenance p = scribe.provenance();
+            assertEquals(tesseractLib.toRealPath(),
+                    p.tesseract().orElseThrow().toRealPath(),
+                    "TessVersion must be answered by the bound Tesseract: " + p);
+            assertEquals(leptonicaLib.toRealPath(),
+                    p.leptonica().orElseThrow().toRealPath(),
+                    "pixCreate must be answered by the preloaded Leptonica: " + p);
+            assertEquals(scribe.tesseractVersion(), p.tesseractVersion());
+            System.out.println("[provenance] " + p);
         }
     }
 
